@@ -35,10 +35,6 @@ class PreprocessingMixin:
         if not images:
             return self._fail("No camera frames available")
 
-        joint_dict = self._robot.get_joint_positions()
-        if not joint_dict:
-            return self._fail("No joint positions available")
-
         batch: Dict[str, Any] = {}
 
         for cam_name, policy_key in self._cameras.items():
@@ -57,6 +53,14 @@ class PreprocessingMixin:
             tensor = torch.from_numpy(img.copy()).to(torch.float32) / 255.0
             tensor = tensor.permute(2, 0, 1).contiguous().unsqueeze(0)
             batch[policy_key] = tensor.to(self._device)
+
+        if _STATE_KEY not in self._policy.config.input_features:
+            batch["task"] = [task_instruction or ""]
+            return batch
+
+        joint_dict = self._robot.get_joint_positions()
+        if not joint_dict:
+            return self._fail("No joint positions available")
 
         state_parts: List[np.ndarray] = []
         for modality in self._state_modalities:

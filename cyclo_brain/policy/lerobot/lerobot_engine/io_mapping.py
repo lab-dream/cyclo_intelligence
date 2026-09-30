@@ -29,7 +29,12 @@ from typing import Dict, Iterable
 
 from .constants import IMAGE_KEY_PREFIX as _IMAGE_KEY_PREFIX
 
-from robot_client import RobotClient
+try:
+    from robot_client import RobotClient
+except ModuleNotFoundError as exc:
+    if exc.name != "robot_client":
+        raise
+    RobotClient = None  # Offline dataset inference has no hardware dependency.
 
 
 logger = logging.getLogger("lerobot_engine")
@@ -45,6 +50,8 @@ class IoMappingMixin:
 
     def _init_robot(self, robot_type: str) -> None:
         """Create RobotClient + resolve camera / state mappings."""
+        if RobotClient is None:
+            raise RuntimeError("Live inference requires the RobotClient SDK")
         self._robot = RobotClient(robot_type)
 
         # Cameras: only those that match a policy input key

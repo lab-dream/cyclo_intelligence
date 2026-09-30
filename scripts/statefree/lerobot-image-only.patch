@@ -1,0 +1,82 @@
+diff --git a/src/lerobot/policies/diffusion/configuration_diffusion.py b/src/lerobot/policies/diffusion/configuration_diffusion.py
+index ed04ab54..e9f54239 100644
+--- a/src/lerobot/policies/diffusion/configuration_diffusion.py
++++ b/src/lerobot/policies/diffusion/configuration_diffusion.py
+@@ -31,7 +31,7 @@ class DiffusionConfig(PreTrainedConfig):
+     Those are: `input_features` and `output_features`.
+ 
+     Notes on the inputs and outputs:
+-        - "observation.state" is required as an input key.
++        - "observation.state" is optional; omit it for image-only conditioning.
+         - Either:
+             - At least one key starting with "observation.image is required as an input.
+               AND/OR
+diff --git a/src/lerobot/policies/diffusion/modeling_diffusion.py b/src/lerobot/policies/diffusion/modeling_diffusion.py
+index 8758a7e2..38ef42d6 100644
+--- a/src/lerobot/policies/diffusion/modeling_diffusion.py
++++ b/src/lerobot/policies/diffusion/modeling_diffusion.py
+@@ -91,9 +91,10 @@ class DiffusionPolicy(PreTrainedPolicy):
+     def reset(self):
+         """Clear observation and action queues. Should be called on `env.reset()`"""
+         self._queues = {
+-            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+             ACTION: deque(maxlen=self.config.n_action_steps),
+         }
++        if self.config.robot_state_feature:
++            self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+         if self.config.image_features:
+             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+         if self.config.env_state_feature:
+@@ -193,7 +194,7 @@ class DiffusionModel(nn.Module):
+         self.config = config
+ 
+         # Build observation encoders (depending on which observations are provided).
+-        global_cond_dim = self.config.robot_state_feature.shape[0]
++        global_cond_dim = self.config.robot_state_feature.shape[0] if self.config.robot_state_feature else 0
+         if self.config.image_features:
+             num_images = len(self.config.image_features)
+             if self.config.use_separate_rgb_encoder_per_camera:
+@@ -266,10 +267,18 @@ class DiffusionModel(nn.Module):
+ 
+         return sample
+ 
++    def _observation_shape(self, batch: dict[str, Tensor]) -> tuple[int, int]:
++        # Only configured inputs may determine conditioning or batch dimensions.
++        if self.config.robot_state_feature:
++            return batch[OBS_STATE].shape[:2]
++        if self.config.image_features:
++            return batch[OBS_IMAGES].shape[:2]
++        return batch[OBS_ENV_STATE].shape[:2]
++
+     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+         """Encode image features and concatenate them all together along with the state vector."""
+-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+-        global_cond_feats = [batch[OBS_STATE]]
++        batch_size, n_obs_steps = self._observation_shape(batch)
++        global_cond_feats = [batch[OBS_STATE]] if self.config.robot_state_feature else []
+         # Extract image features.
+         if self.config.image_features:
+             if self.config.use_separate_rgb_encoder_per_camera:
+@@ -315,7 +324,7 @@ class DiffusionModel(nn.Module):
+             "observation.environment_state": (B, n_obs_steps, environment_dim)
+         }
+         """
+-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
++        batch_size, n_obs_steps = self._observation_shape(batch)
+         assert n_obs_steps == self.config.n_obs_steps
+ 
+         # Encode image features and concatenate them all together along with the state vector.
+@@ -346,9 +355,11 @@ class DiffusionModel(nn.Module):
+         }
+         """
+         # Input validation.
+-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
++        assert set(batch).issuperset({ACTION, "action_is_pad"})
++        if self.config.robot_state_feature:
++            assert OBS_STATE in batch
+         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+-        n_obs_steps = batch[OBS_STATE].shape[1]
++        _, n_obs_steps = self._observation_shape(batch)
+         horizon = batch[ACTION].shape[1]
+         assert horizon == self.config.horizon
+         assert n_obs_steps == self.config.n_obs_steps

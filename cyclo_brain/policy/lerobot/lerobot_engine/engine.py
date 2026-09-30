@@ -72,7 +72,10 @@ from engine import InferenceEngine  # noqa: E402
 
 import torch  # noqa: E402
 
-from robot_client import RobotClient  # noqa: E402
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from robot_client import RobotClient
 from lerobot.policies.pretrained import PreTrainedPolicy  # noqa: E402
 
 # Mixins are sub-package siblings. The Engine process loads the package via
@@ -84,12 +87,14 @@ from .optimization import OptimizationMixin  # noqa: E402
 from .io_mapping import IoMappingMixin  # noqa: E402
 from .preprocessing import PreprocessingMixin  # noqa: E402
 from .prediction import PredictionMixin  # noqa: E402
+from .recorded import RecordedObservationMixin  # noqa: E402
 
 
 logger = logging.getLogger("lerobot_engine")
 
 
 class LeRobotEngine(
+    RecordedObservationMixin,
     LoadingMixin,
     OptimizationMixin,
     IoMappingMixin,
@@ -149,6 +154,17 @@ class LeRobotEngine(
             # a training-output root containing ``training_state/``
             # alongside (lerobot-train layout).
             model_path = self._resolve_model_dir(model_path)
+            # EEF outputs must never enter the runtime's joint command publisher.
+            from pathlib import Path
+            import json
+            representation = Path(model_path) / "action_representation.json"
+            if representation.exists():
+                kind = json.loads(representation.read_text()).get("representation")
+                if kind != "absolute_joint":
+                    return self._fail(
+                        f"Action representation {kind!r} requires an EEF/IK adapter; "
+                        "use load_recorded_policy for offline simulation."
+                    )
 
             # Skip weights load when a second LOAD arrives before UNLOAD and
             # we're just reattaching the robot client for the same model.

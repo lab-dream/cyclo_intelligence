@@ -75,6 +75,16 @@ class Preprocessor(PreprocessingMixin):
 
 
 class PreprocessingTest(unittest.TestCase):
+    def test_image_only_does_not_read_joint_state(self):
+        preprocessor = Preprocessor([], expected=0)
+        preprocessor._policy.config.input_features = {}
+        def forbidden():
+            raise AssertionError("Image-only inference read joint state")
+        preprocessor._robot.get_joint_positions = forbidden
+        batch = preprocessor._build_observation("task")
+        self.assertNotIn(STATE_KEY, batch)
+        self.assertEqual(batch["task"], ["task"])
+
     def test_pads_short_state_to_policy_shape(self):
         preprocessor = Preprocessor([1.0, 2.0], expected=4)
 
