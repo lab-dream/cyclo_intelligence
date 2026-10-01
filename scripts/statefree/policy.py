@@ -15,7 +15,7 @@ import time
 import numpy as np
 import torch
 
-from core import BASE_COMMIT, CAMERAS, LAYOUT, read_json, sha256, write_json
+from core import BASE_COMMIT, CAMERAS, checked_action_spec, read_json, sha256, write_json
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -30,9 +30,12 @@ SEED = 42
 
 def config(dataset, output, steps=20, device=None):
     info = read_json(Path(dataset)/'meta/info.json')
+    spec = checked_action_spec(read_json(Path(dataset)/'meta/action_representation.json'))
+    if info['features']['action']['shape'] != [spec['action_dim']] or info['features']['action']['names'] != spec['action_layout']:
+        raise ValueError('Dataset features and action spec disagree')
     inputs = {k:PolicyFeature(type=FeatureType.VISUAL, shape=(3, *info['features'][k]['shape'][:2])) for k in CAMERAS}
     policy = DiffusionConfig(input_features=inputs,
-        output_features={'action':PolicyFeature(type=FeatureType.ACTION, shape=(len(LAYOUT),))},
+        output_features={'action':PolicyFeature(type=FeatureType.ACTION, shape=(spec['action_dim'],))},
         device=device or ('cuda' if torch.cuda.is_available() else 'cpu'), push_to_hub=False,
         n_obs_steps=2, horizon=16, n_action_steps=8, drop_n_last_frames=0,
         resize_shape=(96,96), crop_ratio=1., pretrained_backbone_weights=None,
@@ -59,6 +62,7 @@ def verify(dataset, out):
     torch.set_num_threads(4)
     cfg = config(dataset, Path(out)/'unused')
     ds = make_dataset(cfg)
+    action_dim = cfg.policy.action_feature.shape[0]
     assert 'observation.state' not in ds.meta.features
     sample = ds[0]
     batch = next(iter(torch.utils.data.DataLoader(ds, batch_size=2, num_workers=0)))
@@ -91,7 +95,7 @@ def verify(dataset, out):
     optim.step()
     assert weights_digest(p) != before
     p.eval()
-    noise = torch.randn(2, p.config.horizon, len(LAYOUT), device=p.config.device)
+    noise = torch.randn(2, p.config.horizon, action_dim, device=p.config.device)
     images = {k:batch[k] for k in CAMERAS}
     with torch.inference_mode():
         a = p.predict_action_chunk(images, noise=noise.clone())
@@ -103,7 +107,7 @@ def verify(dataset, out):
     with torch.inference_mode():
         for _ in range(18):
             action = p.select_action({k:v[:, -1] for k,v in images.items()})
-            assert action.shape == (2,len(LAYOUT)) and torch.isfinite(action).all()
+            assert action.shape == (2,action_dim) and torch.isfinite(action).all()
     p.reset()
     checkpoint = Path(out)/'reload_test'
     p.save_pretrained(checkpoint); pre.save_pretrained(checkpoint); post.save_pretrained(checkpoint)
@@ -120,11 +124,12 @@ def verify(dataset, out):
     state_policy.eval()
     with torch.inference_mode():
         old_path = state_policy.select_action({**{k:v[:,-1] for k,v in images.items()},'observation.state':state_batch['observation.state'][:,-1]})
-    assert old_path.shape == (2,len(LAYOUT))
+    assert old_path.shape == (2,action_dim)
     report = {'status':'PASS','loss':float(loss.detach()),'state_based_loss':float(state_loss.detach()),
         'normalization_max_error':normalization_error,'state_invariance_exact':True,
         'fresh_process_cyclo_reload':True,'episode_padding':True,'input_keys':list(p.config.input_features),
-        'input_shapes':{k:list(batch[k].shape) for k in CAMERAS},'parameters':sum(v.numel() for v in p.parameters())}
+        'input_shapes':{k:list(batch[k].shape) for k in CAMERAS},'action_dim':action_dim,'action_spec':checked_action_spec(read_json(Path(dataset)/'meta/action_representation.json')),
+        'parameters':sum(v.numel() for v in p.parameters())}
     write_json(Path(out)/'policy_tests.json',report)
     print(json.dumps(report),flush=True)
 
@@ -133,10 +138,13 @@ def reload_test(dataset, checkpoint):
     from lerobot_engine import LeRobotEngine
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     ds = LeRobotDataset('local/statefree-smoke',root=dataset,video_backend='pyav')
-    engine = LeRobotEngine(); engine.load_recorded_policy(checkpoint)
+    engine = LeRobotEngine(); metadata = engine.load_recorded_policy(checkpoint)
+    spec = checked_action_spec(metadata); action_dim = spec['action_dim']
+    dataset_spec = checked_action_spec(read_json(Path(dataset)/'meta/action_representation.json'))
+    if spec != dataset_spec: raise ValueError('Dataset and checkpoint action specs differ')
     engine.observe_recorded(ds[0]); engine.observe_recorded(ds[1])
     torch.manual_seed(42); a = engine.predict_recorded_chunk()
-    assert a['action'].shape == (8,len(LAYOUT)) and np.isfinite(a['action']).all()
+    assert a['action'].shape == (8,action_dim) and np.isfinite(a['action']).all()
     engine.reset_recorded_episode()
     for i in range(2):
         engine.observe_recorded({**ds[i],'observation.state':torch.randn(22)*999})
@@ -196,6 +204,8 @@ def train_once(dataset, output, steps):
             'checkpoint':str(checkpoint.resolve()),'seed':SEED,'torch':torch.__version__,
             'gpu':torch.cuda.get_device_name(), 'lerobot_import':__import__('lerobot').__file__,
             'diffusion_code_sha256':sha256(Path(__import__('lerobot.policies.diffusion.modeling_diffusion',fromlist=['x']).__file__)),
+            'training_code_sha256':{name:sha256(Path(__file__).parent/name) for name in ('core.py','policy.py')},
+            'action_spec':checked_action_spec(read_json(metadata)),
             'lerobot_base_commit':BASE_COMMIT}
     write_json(Path(output)/'training_evidence.json',report)
     print(json.dumps(report),flush=True)

@@ -17,6 +17,33 @@ TCP = np.array([0., 0., -.215])
 LAYOUT = [f'{side}.{term}' for side in ('left', 'right')
           for term in ('dx', 'dy', 'dz', 'rx', 'ry', 'rz', 'gripper_rad')]
 LAYOUT += ['head_joint1_rad', 'head_joint2_rad', 'lift_joint_m']
+UNITS = ['m']*3+['rad']*4+['m']*3+['rad']*4+['rad','rad','m']
+DEFAULT_ERJ_JOINTS = ['arm_l_joint1', 'arm_r_joint1']
+
+
+def action_spec(action_mode='eef', erj_joints=None):
+    """The legacy EEF prefix is invariant; ERJ appends named absolute targets."""
+    if action_mode not in ('eef', 'erj'):
+        raise ValueError('action_mode must be eef or erj')
+    joints = list(DEFAULT_ERJ_JOINTS if erj_joints is None and action_mode == 'erj' else erj_joints or [])
+    if action_mode == 'eef' and joints:
+        raise ValueError('erj_joints requires action_mode=erj')
+    if action_mode == 'erj' and (len(joints) != 2 or any(
+            name not in [f'arm_{side}_joint{i}' for i in range(1, 8)]
+            for side, name in zip(('l', 'r'), joints))):
+        raise ValueError('FFW ERJ requires one named left arm joint then one named right arm joint')
+    layout = LAYOUT + [f'{name}_absolute_rad' for name in joints]
+    return {'action_mode': action_mode, 'action_dim': len(layout), 'action_layout': layout,
+            'action_units': UNITS + ['rad']*len(joints), 'erj_joints': joints,
+            'erj_offset': len(LAYOUT), 'erj_semantics': 'same-row original joint action absolute target radians'}
+
+
+def checked_action_spec(metadata):
+    spec = action_spec(metadata.get('action_mode', 'eef'), metadata.get('erj_joints', []))
+    for key in ('action_layout', 'action_units', 'action_dim', 'erj_offset'):
+        if key in metadata and metadata[key] != spec[key]:
+            raise ValueError(f'Inconsistent action spec: {key}')
+    return spec
 
 
 def read_json(path):
@@ -137,16 +164,45 @@ class Robot:
             poses = inv @ poses
         return poses
 
-    def ik(self, targets, max_change=.12, iterations=60):
+    def elbows(self):
+        # The joint4 anchor is the actual elbow flexion pivot, not the ERJ joint.
+        return np.stack([self.data.xanchor[self.model.joint(f'arm_{s}_joint4').id].copy()
+                         for s in ('l', 'r')])
+
+    def eef_errors(self, targets):
+        poses = self.eef()
+        return (np.linalg.norm(targets[:, :3, 3] - poses[:, :3, 3], axis=1),
+                np.array([Rotation.from_matrix(t[:3, :3] @ p[:3, :3].T).magnitude()
+                          for t, p in zip(targets, poses)]))
+
+    def ik(self, targets, max_change=.12, iterations=60, fixed_joints=None):
         old = self.data.qpos.copy()
+        fixed_joints = dict(fixed_joints or {})
+        allowed = {f'arm_{s}_joint{i}' for s in ('l', 'r') for i in range(1, 8)}
+        if not set(fixed_joints) <= allowed or not all(np.isfinite(v) for v in fixed_joints.values()):
+            raise ValueError('Fixed IK targets must be finite named arm joint angles')
+        self.last_ik = {'reason': 'iteration_limit', 'fixed_joints': fixed_joints, 'iterations': 0}
+        # Reject infeasible commands rather than silently relaxing the equality,
+        # clamping a predicted ERJ angle, or overwriting a solved configuration.
+        for name, value in fixed_joints.items():
+            joint = self.model.joint(name)
+            if not joint.range[0] <= value <= joint.range[1] or abs(value-old[joint.qposadr[0]]) > max_change+1e-12:
+                self.last_ik['reason'] = 'fixed_target_outside_joint_or_step_limit'
+                return False, *self.eef_errors(targets)
+        for name, value in fixed_joints.items():
+            self.data.qpos[self.model.joint(name).qposadr[0]] = value
+        if fixed_joints:
+            self.mj.mj_forward(self.model, self.data)
         arms = []
         for side in ('l', 'r'):
-            joints = [self.model.joint(f'arm_{side}_joint{i}') for i in range(1, 8)]
+            joints = [self.model.joint(f'arm_{side}_joint{i}') for i in range(1, 8)
+                      if f'arm_{side}_joint{i}' not in fixed_joints]
             arms.append((np.array([j.qposadr[0] for j in joints]),
                          np.array([j.dofadr[0] for j in joints]),
                          np.array([j.range for j in joints]),
                          self.model.body(f'arm_{side}_link7').id))
-        for _ in range(iterations):
+        for iteration in range(iterations):
+            self.last_ik['iterations'] = iteration+1
             poses = self.eef()
             for s, (qids, dids, limits, bid) in enumerate(arms):
                 e = np.r_[targets[s, :3, 3] - poses[s, :3, 3],
@@ -165,6 +221,9 @@ class Robot:
             roterr = np.array([Rotation.from_matrix(t[:3, :3] @ p[:3, :3].T).magnitude()
                                for t, p in zip(targets, poses)])
             if poserr.max() < .002 and roterr.max() < .03:
+                self.last_ik['reason'] = 'converged'
+                assert all(self.data.qpos[self.model.joint(name).qposadr[0]] == value
+                           for name, value in fixed_joints.items())
                 return True, poserr, roterr
         self.data.qpos[:] = old
         self.mj.mj_forward(self.model, self.data)
@@ -208,7 +267,7 @@ def validate_episode_alignment(table, episode, fps):
     return corrections
 
 
-def convert(source, destination, episodes, scene):
+def convert(source, destination, episodes, scene, action_mode='eef', erj_joints=None):
     """Write real LeRobot v3 metadata/parquet; link unchanged source videos."""
     import copy
     import shutil
@@ -217,6 +276,8 @@ def convert(source, destination, episodes, scene):
     from lerobot.datasets.compute_stats import aggregate_stats
 
     source, destination = Path(source).resolve(), Path(destination).resolve()
+    spec = action_spec(action_mode, erj_joints)
+    layout = spec['action_layout']
     if destination.exists():
         raise FileExistsError(f'Conversion destination already exists: {destination}')
     info = read_json(source / 'meta/info.json')
@@ -235,7 +296,7 @@ def convert(source, destination, episodes, scene):
     fk, robot = URDFFK(), Robot(scene)
     new_features = {k: copy.deepcopy(v) for k, v in features.items()
                     if k != 'observation.state' and (not k.startswith('observation.images.') or k in CAMERAS)}
-    new_features['action'].update(shape=[len(LAYOUT)], names=LAYOUT)
+    new_features['action'].update(shape=[len(layout)], names=layout)
     new_rows, all_stats, source_files = [], [], {source/'meta/info.json', source/'meta/tasks.parquet'}
     source_files.update((source/'meta/episodes').rglob('*.parquet'))
     offset, worst_reconstruction, worst_fk = 0, 0., 0.
@@ -254,14 +315,16 @@ def convert(source, destination, episodes, scene):
         assert table['frame_index'].to_pylist() == list(range(n))
         reference = np.stack([fk.eef(q, names) for q in state])
         target = np.stack([fk.eef(q, action_names) for q in joint_action])
-        actions = np.empty((n, len(LAYOUT)), dtype=np.float32)
+        actions = np.empty((n, len(layout)), dtype=np.float32)
         for i in range(n):
             for s, grip_index in enumerate((7, 15)):
                 actions[i, s*7:s*7+6] = relative(reference[i, s], target[i, s])
                 actions[i, s*7+6] = joint_action[i, grip_index]
                 error = np.max(np.abs(compose(reference[i, s], actions[i, s*7:s*7+6]) - target[i, s]))
                 worst_reconstruction = max(worst_reconstruction, float(error))
-            actions[i, 14:] = joint_action[i, 16:19]
+            actions[i, 14:17] = joint_action[i, 16:19]
+        if spec['erj_joints']:
+            actions[:, 17:] = joint_action[:, [action_names.index(name) for name in spec['erj_joints']]]
         for i in np.linspace(0, n-1, min(12, n), dtype=int):
             for q, poses in ((state[i], reference[i]), (joint_action[i], target[i])):
                 robot.set_joints(q, names)
@@ -270,7 +333,7 @@ def convert(source, destination, episodes, scene):
         out = table.drop(['observation.state', 'action']).replace_schema_metadata(None)
         out = out.set_column(out.schema.get_field_index('episode_index'), 'episode_index', pa.array([new_index]*n, type=pa.int64()))
         out = out.set_column(out.schema.get_field_index('index'), 'index', pa.array(range(offset, offset+n), type=pa.int64()))
-        out = out.append_column('action', pa.FixedSizeListArray.from_arrays(pa.array(actions.ravel()), len(LAYOUT)))
+        out = out.append_column('action', pa.FixedSizeListArray.from_arrays(pa.array(actions.ravel()), len(layout)))
         rel_data = Path(f'data/chunk-{new_index//1000:03d}/file-{new_index%1000:03d}.parquet')
         (destination/rel_data).parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(out, destination/rel_data)
@@ -314,8 +377,8 @@ def convert(source, destination, episodes, scene):
     shutil.copy2(source/'meta/tasks.parquet', destination/'meta/tasks.parquet')
     model_xmls = sorted(Path(scene).parent.glob('*.xml'))
     metadata = {
-        'schema_version':1, 'representation':'per_step_body_se3_rotvec', 'action_layout':LAYOUT,
-        'action_units':['m']*3+['rad']*4+['m']*3+['rad']*4+['rad','rad','m'],
+        'schema_version':2, 'representation':'per_step_body_se3_rotvec', **spec,
+        'action_normalization_stats':{s:v.tolist() for s,v in combined['action'].items()},
         'formula':'Delta_t = inverse(FK(measured_state_t)) @ FK(command_t); target = current_sim_pose @ Delta_t',
         'rotation':'SO(3) rotation vector, radians; composed by matrix multiplication',
         'quaternion_order':None, 'fps':info['fps'], 'joint_names':names,

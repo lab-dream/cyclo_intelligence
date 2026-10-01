@@ -30,6 +30,101 @@ Use a new `--work-dir` for an entirely fresh run. `--episodes all` converts the
 full dataset, episode by episode; `--episodes 0,1` is the default small subset.
 The wrapper never commits or pushes automatically.
 
+## Optional ERJoint arm posture control
+
+`--action-mode eef` preserves the original 17 outputs and is the default.
+`--action-mode erj` appends two **absolute commanded joint angles in radians**:
+the default names are `arm_l_joint1,arm_r_joint1`, configurable with
+`--erj-joints`. The first 17 EEF/gripper/head/lift outputs, same-row alignment,
+per-step body-frame SE(3) convention, and image-only policy inputs are unchanged.
+Labels come from the original **action**, never `observation.state`.
+Conversion writes `relative_erj` separately, links original videos, recomputes
+19-dimensional statistics, and stores names, units, dimensions and action
+statistics in `action_representation.json`. The checkpoint includes that spec
+and its own processor normalization tensors. A fresh 19-output model is trained;
+changing a 17-output checkpoint's config does not make it compatible.
+
+This implements the joint-first ERJ construction in
+[Redundancy-aware Action Spaces for Robot Learning, IV-C](https://arxiv.org/html/2406.04144#S4.SS3).
+The selected joints are the first joints of the **arms**, not the mobile base
+or lift. The actual elbow markers use the `arm_{l,r}_joint4` anchors. The FFW
+model's joint axes and offsets differ from a Panda, so numbering alone is not
+a redundancy test. `validate_erj.py` checks every candidate's reduced 6x6
+Jacobian on measured and commanded sample poses before training, and rejects
+a selected joint that loses rank in those samples. It then solves actual
+demonstration EEF/selected-joint targets from measured states and nearby
+perturbations, verifying exact equality, limits, continuity and failure holds.
+Local full rank does not guarantee global reachability.
+
+`--elbow-control on` removes the selected columns from the IK optimization and
+holds the predicted angles fixed throughout every iteration. It does not merely
+seed IK or overwrite the result afterward. A selected angle outside its joint
+range or the existing 0.12 rad per-action bound causes a failure and a full hold;
+the angle is not silently clamped or the equality relaxed. Other infeasible
+targets also hold the preceding pose. `off` retains the 19-output model and
+ignores the two extra outputs, using the original EEF IK. Existing EEF
+checkpoints support OFF; requesting ON produces an explicit error.
+
+The accepted joint waypoint still passes through the existing 100 Hz
+cubic/quintic interpolation. The ERJ equality applies to the IK endpoint;
+intermediate spline commands move continuously toward it. Fixed-base, head,
+lift, gripper and auxiliary limiting rules are unchanged.
+
+Run from the repository root in the same environment as the existing smoke:
+
+```bash
+erj_args=(
+  --dataset-root /media/son/Remember/AX_Humanoid/dataset/merge_0616_to_0819_v3
+  --work-dir ../statefree_erj --episodes 0,1,56 --episode 1 --frames 300
+  --action-mode erj --erj-joints arm_l_joint1,arm_r_joint1
+)
+./scripts/run_statefree_smoke.sh "${erj_args[@]}" \
+  --elbow-control on --ssh-host gpuserver --train-seconds 300 \
+  --remote-dir /data/son_statefree_erj_smoke \
+  --remote-python /data/son_statefree_smoke/venv/bin/python \
+  --remote-video-root /data/son_statefree_200k/relative_eef \
+  --gpu MIG-cda978fb-4f3b-53d0-b151-1946fc038254
+
+./scripts/run_statefree_smoke.sh "${erj_args[@]}" --replay-only \
+  --elbow-control off --actions-from ../statefree_erj/replay_on/replay.npz
+```
+
+The example uses a 3-episode smoke subset (1,706 frames), not the full dataset.
+The named MIG device is the one used in this workspace; select an allocated
+device on other servers. `--remote-video-root` is optional: when supplied,
+existing remote videos are SHA-256 verified and linked rather than uploaded
+again. Missing or mismatched videos fail explicitly. The separate ERJ remote
+directory preserves the ongoing 200k-step EEF trainer and its checkpoints.
+
+For independent episodes and matching ON/OFF videos, with the replay Python
+environment (`PYTHONPATH` described below):
+
+```bash
+../.statefree-venv/bin/python scripts/statefree/compare_erj.py \
+  --dataset ../statefree_erj/relative_erj --checkpoint ../statefree_erj/checkpoint \
+  --scene /home/son/Downloads/AI_Worker_Practice/third_party/robotis_mujoco_menagerie/robotis_ffw/scene_ffw_sg2.xml \
+  --output ../statefree_erj/comparison --episodes 0,1,2 --frames 300
+```
+
+Converted indices 0,1,2 correspond to source episodes 0,1,56 in this subset.
+Each case saves live Cyclo predictions once, then reuses them from the identical
+initial pose for OFF. The absolute EEF targets may diverge after the poses
+diverge: the **same per-step relative action** is composed with each mode's own
+current pose. `replay.npz` records selected targets/actual angles/errors, elbow
+positions, EEF errors and IK failure reasons; `trajectory.npz` also records
+100 Hz elbow paths. Videos show the robot, camera inputs, EEF frames/trails and
+left/right elbow markers (magenta/cyan). Native 1x and 0.25x comparisons are saved.
+These are recorded-observation, kinematic replays, not closed-loop task-success
+or performance-improvement evaluations. No hardware publisher is created.
+
+Run the regression suite with `pytest scripts/statefree/test_core.py
+scripts/statefree/test_interpolation.py scripts/statefree/test_erj.py` in the
+configured environment. `STATEFREE_SCENE` can override the local MJCF path for
+the real-model IK tests; those tests are explicitly skipped if no model exists.
+No additional LeRobot submodule patch is needed for ERJ: the existing pinned
+image-only patch and idempotent `bootstrap.sh` apply on a clean clone, and
+Diffusion's configured action dimension supplies the extra outputs.
+
 ## Cubic and quintic joint interpolation
 
 Replay now defaults to `--interpolation quintic --control-fps 100 --video-fps 100`.

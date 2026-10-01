@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from core import CAMERAS, Robot, compose, read_json, sha256, transform, write_json
+from core import CAMERAS, Robot, checked_action_spec, compose, read_json, sha256, transform, write_json
 from interpolation import METHODS, blend, sample_joints, rates, control_bounds, motion_metrics
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_engine import LeRobotEngine
@@ -34,7 +34,7 @@ def add_line(scene, a, b, color, radius=.002, arrow=False):
     scene.ngeom+=1
 
 
-def decorations(scene, target, achieved, reference, trails):
+def decorations(scene, target, achieved, reference, trails, elbow_trail=None):
     colors=((1.,.35,.12,1.),(.1,1.,.3,1.),(.2,.7,1.,1.))
     for points,color in zip(trails,colors):
         for i in range(max(1,len(points)-180),len(points),2):
@@ -49,12 +49,20 @@ def decorations(scene, target, achieved, reference, trails):
             for axis in range(3):
                 d=np.eye(3)[axis]*.008
                 add_line(scene,p-d,p+d,color,.003)
+    if elbow_trail:
+        for side, color in enumerate(((1.,.2,1.,1.),(.1,1.,1.,1.))):
+            for i in range(max(1,len(elbow_trail)-180),len(elbow_trail),2):
+                add_line(scene,elbow_trail[i-1][side],elbow_trail[i][side],color,.003)
+            for axis in range(3):
+                delta=np.eye(3)[axis]*.018;point=elbow_trail[-1][side]
+                add_line(scene,point-delta,point+delta,color,.005)
 
 
 def render_frame(renderer, robot, camera, target, achieved, reference, trails, sample, frame, fps, ok, clips, latency,
-                 interpolation='none', control_time=None, control_fps=30):
+                 interpolation='none', control_time=None, control_fps=30, elbow_trail=None,
+                 action_mode='eef', elbow_control='off', selected_error=()):
     renderer.update_scene(robot.data,camera=camera)
-    decorations(renderer.scene,target,achieved,reference,trails)
+    decorations(renderer.scene,target,achieved,reference,trails,elbow_trail)
     rgb=renderer.render().copy()
     panel=np.full((720,320,3),22,dtype=np.uint8)
     for side,key in enumerate(CAMERAS):
@@ -72,17 +80,31 @@ def render_frame(renderer, robot, camera, target, achieved, reference, trails, s
     for i,(text,color) in enumerate(lines):
         cv2.putText(panel,text,(8,460+i*27),cv2.FONT_HERSHEY_SIMPLEX,.47,color,1,cv2.LINE_AA)
     cv2.putText(rgb,f'{interpolation.upper()} | IK joint spline | control {control_fps} Hz',(15,26),cv2.FONT_HERSHEY_SIMPLEX,.6,(240,240,240),1,cv2.LINE_AA)
+    error_text=' / '.join(f'{value:.4f}' for value in selected_error)
+    cv2.putText(rgb,f'{action_mode.upper()} | elbow control {elbow_control.upper()} | selected error rad: {error_text}',
+                (15,52),cv2.FONT_HERSHEY_SIMPLEX,.53,(240,240,240),1,cv2.LINE_AA)
+    cv2.putText(panel,'MAGENTA / CYAN: elbow L / R',(8,710),cv2.FONT_HERSHEY_SIMPLEX,.45,(240,200,240),1,cv2.LINE_AA)
     return np.concatenate([rgb,panel],axis=1)
 
 
 def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
-           interpolation='quintic',control_fps=100,video_fps=100,actions_from=None):
+           interpolation='quintic',control_fps=100,video_fps=100,actions_from=None,
+           action_mode=None,elbow_control='off'):
     torch.set_num_threads(4);torch.manual_seed(42)
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     if interpolation not in METHODS:raise ValueError(f'Unknown interpolation: {interpolation}')
     metadata=read_json(Path(checkpoint)/'action_representation.json')
+    spec=checked_action_spec(metadata)
+    if action_mode is not None and action_mode!=spec['action_mode']:
+        raise ValueError('Requested action_mode differs from the checkpoint action spec')
+    action_mode=spec['action_mode']
+    if elbow_control not in ('on','off'):raise ValueError('elbow_control must be on or off')
+    if elbow_control=='on' and action_mode!='erj':
+        raise ValueError('elbow_control=on requires a separately trained ERJ checkpoint; EEF checkpoints support OFF only')
     checkpoint_hash=sha256(Path(checkpoint)/'model.safetensors')
     action_metadata_hash=sha256(Path(dataset)/'meta/action_representation.json')
+    if sha256(Path(checkpoint)/'action_representation.json')!=action_metadata_hash:
+        raise ValueError('Checkpoint and dataset action metadata differ')
     cached=None;engine=None
     if actions_from:
         receipt=read_json(Path(actions_from).parent/'replay_report.json')
@@ -95,6 +117,7 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
     ds=LeRobotDataset('local/statefree-smoke',root=dataset,video_backend='pyav')
     ref=np.load(Path(dataset)/'reference'/f'episode_{episode:06d}.npz')
     names=ref['names'].tolist(); robot=Robot(scene)
+    selected_ids=[robot.model.joint(name).qposadr[0] for name in spec['erj_joints']]
     assert metadata['urdf_sha256']==sha256(Path(__file__).resolve().parents[2]/'shared/shared/robot_configs/urdf/ffw_sg2_follower.urdf')
     for name,digest in metadata['model_xml_sha256'].items():
         assert sha256(Path(scene).parent/name)==digest,'Robot model changed since conversion'
@@ -134,12 +157,14 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
         viewer.cam.lookat[:]=camera.lookat;viewer.cam.distance=camera.distance;viewer.cam.azimuth=camera.azimuth;viewer.cam.elevation=camera.elevation
     logs={k:[] for k in ('raw_action','normalized_action','applied_action','raw_target','target','achieved','reference','qpos','joint_result',
                              'limited','ik_ok','ik_position_residual','ik_rotation_residual','achieved_position_error','inference_seconds','chunk_index',
-                             'source_time','segment_start_time','segment_end_time')}
+                             'source_time','segment_start_time','segment_end_time',
+                             'selected_target','selected_actual','selected_error','ik_reason','elbow_position','achieved_rotation_error')}
     chunk=None;chunk_position=0;chunk_index=-1;latency=0.;inference_total=0.;ik_total=0.
     trajectory={'time':[0.], 'joint_result':[initial[joint_ids].copy()], 'eef':[robot.eef()],
-                'cartesian_chord_error_m':[np.zeros(2)],'control_tick':[0],'policy_frame':[-1],'phase':[0.]}
+                'cartesian_chord_error_m':[np.zeros(2)],'control_tick':[0],'policy_frame':[-1],'phase':[0.],
+                'elbow_position':[robot.elbows()]}
     rendered_frames=0
-    trails=[[],[],[]];wall_start=time.perf_counter()
+    trails=[[],[],[]];elbow_trail=[];wall_start=time.perf_counter()
     try:
         for frame in range(frames):
             start_tick,end_tick=map(int,bounds[frame]);substeps=end_tick-start_tick
@@ -157,7 +182,7 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                 raw=cached['raw_action'][frame].copy();normalized=cached['normalized_action'][frame].copy()
                 chunk_index=int(cached['chunk_index'][frame]);current_latency=0.
                 if cached['inference_seconds'][frame] > 0:latency=float(cached['inference_seconds'][frame])
-            assert np.isfinite(raw).all()
+            assert raw.shape==(spec['action_dim'],) and normalized.shape==raw.shape and np.isfinite(raw).all()
             applied=raw.copy();current=robot.eef();previous=robot.data.qpos.copy()
             raw_target=np.stack([compose(current[s],raw[s*7:s*7+6]) for s in range(2)])
             for s in range(2):
@@ -172,16 +197,20 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                 robot.data.qpos[j.qposadr[0]]=applied[index]
             robot.mimic();mujoco.mj_forward(robot.model,robot.data)
             target=np.stack([compose(current[s],applied[s*7:s*7+6]) for s in range(2)])
-            before=time.perf_counter();ok,poserr,roterr=robot.ik(target);ik_total+=time.perf_counter()-before
+            fixed=dict(zip(spec['erj_joints'],map(float,raw[17:]),strict=True)) if elbow_control=='on' else None
+            before=time.perf_counter();ok,poserr,roterr=robot.ik(target,fixed_joints=fixed);ik_total+=time.perf_counter()-before
             if not ok:
                 robot.data.qpos[:]=previous;mujoco.mj_forward(robot.model,robot.data)
             achieved=robot.eef();reference=base_pose @ ref['reference_eef'][frame]
             goal=robot.data.qpos.copy()
             limited=np.abs(applied-raw)>1e-10
             joint_result=np.array([robot.data.qpos[robot.model.joint(name).qposadr[0]] for name in names[:19]])
+            selected_actual=robot.data.qpos[selected_ids].copy();selected_error=selected_actual-raw[17:]
+            if ok and elbow_control=='on':assert np.abs(selected_error).max()<1e-12
             values=(raw,normalized,applied,raw_target,target,achieved,reference,robot.data.qpos.copy(),joint_result,
                     limited,ok,poserr,roterr,np.linalg.norm(target[:,:3,3]-achieved[:,:3,3],axis=1),current_latency,chunk_index,
-                    frame/fps,start_tick/control_fps,end_tick/control_fps)
+                    frame/fps,start_tick/control_fps,end_tick/control_fps,
+                    raw[17:].copy(),selected_actual,selected_error,robot.last_ik['reason'],robot.elbows(),robot.eef_errors(target)[1])
             for key,value in zip(logs,values,strict=True):logs[key].append(value)
             # The IK endpoint is solved once. Only its accepted joint motion is
             # time-parameterized, so all modes retain identical next-frame origins.
@@ -202,16 +231,19 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                 trajectory['control_tick'].append(tick)
                 trajectory['policy_frame'].append(frame)
                 trajectory['phase'].append(u)
+                trajectory['elbow_position'].append(robot.elbows())
                 if tick % render_stride==0:
                     for trail,poses in zip(trails,(target,pose,reference)):trail.append(poses.copy())
+                    elbow_trail.append(robot.elbows())
                     rgb=render_frame(renderer,robot,camera,target,pose,reference,trails,sample,frame,fps,ok,int(limited.sum()),latency,
-                                     interpolation,control_time,control_fps)
+                                     interpolation,control_time,control_fps,elbow_trail,action_mode,elbow_control,
+                                     np.abs(robot.data.qpos[selected_ids]-raw[17:]))
                     encoder.stdin.write(rgb.tobytes());rendered_frames+=1
                     if frame in (0,frames//2,frames-1) and substep==substeps:
                         cv2.imwrite(str(output/f'frame_{frame:04d}.png'),cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR))
                     if viewer:
                         with viewer.lock():
-                            viewer.user_scn.ngeom=0;decorations(viewer.user_scn,target,pose,reference,trails)
+                            viewer.user_scn.ngeom=0;decorations(viewer.user_scn,target,pose,reference,trails,elbow_trail)
                         viewer.sync()
                 if viewer:time.sleep(max(0,wall_start+control_time-time.perf_counter()))
             if frame%60==0:print(f'Replay frame {frame}/{frames}; chunks={chunk_index+1}; IK ok={sum(logs["ik_ok"])}',flush=True)
@@ -243,6 +275,13 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
     if arm_motion<=1e-5:failures.append('No verified arm motion; marker or auxiliary motion alone is insufficient')
     if motion<=1e-5 or chunk_index<2:failures.append('Robot must actually move over multiple policy chunks')
     report={'status':'FAIL' if failures else 'PASS','validation_failures':failures,
+        'action_spec':spec,'action_mode':action_mode,'elbow_control':elbow_control,
+        'erj_constraints':'Exact predicted absolute angles fixed throughout reduced-Jacobian IK; no clipping or fallback' if elbow_control=='on' else 'Additional ERJ outputs ignored; legacy EEF IK',
+        'selected_joint_error_rad':{'max_abs':float(np.abs(arrays['selected_error']).max()),
+            'accepted_max_abs':float(np.abs(arrays['selected_error'][arrays['ik_ok']]).max()) if arrays['ik_ok'].any() else None} if selected_ids else None,
+        'ik_reasons':{str(reason):int(np.sum(arrays['ik_reason']==reason)) for reason in np.unique(arrays['ik_reason'])},
+        'max_achieved_rotation_error_rad':float(arrays['achieved_rotation_error'].max()),
+        'elbow_frames':['arm_l_joint4 anchor','arm_r_joint4 anchor'],
         'mode':'recorded-observation replay; MuJoCo kinematic qpos update; no closed-loop/task evaluation',
         'episode':episode,'source_episode':int(ref['source_episode']),'frames':frames,'fps':fps,
         'simulation_seconds':total_ticks/control_fps,'source_seconds':frames/fps,
@@ -283,6 +322,8 @@ if __name__=='__main__':
     p.add_argument('--interpolation',choices=METHODS,default='quintic')
     p.add_argument('--control-fps',type=int,default=100);p.add_argument('--video-fps',type=int,default=100)
     p.add_argument('--actions-from',help='Replay frozen predictions from a verified replay.npz for a fair comparison')
+    p.add_argument('--action-mode',choices=['eef','erj'],help='Validate against checkpoint metadata; defaults to its saved mode')
+    p.add_argument('--elbow-control',choices=['on','off'],default='off')
     a=p.parse_args()
     replay(a.dataset,a.checkpoint,a.scene,a.output,a.frames,a.episode,a.gui,
-           a.interpolation,a.control_fps,a.video_fps,a.actions_from)
+           a.interpolation,a.control_fps,a.video_fps,a.actions_from,a.action_mode,a.elbow_control)

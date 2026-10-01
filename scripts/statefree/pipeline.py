@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from core import BASE_COMMIT, CAMERAS, ROOT, URDF, convert, read_json, sha256, write_json
+from core import BASE_COMMIT, CAMERAS, ROOT, URDF, action_spec, convert, read_json, sha256, write_json
 
 
 def digest(value):
@@ -36,7 +36,11 @@ class Pipeline:
     def __init__(self,args):
         self.a=args;self.work=Path(args.work_dir).resolve();self.work.mkdir(parents=True,exist_ok=True)
         self.path=self.work/'manifest.json';self.manifest=read_json(self.path) if self.path.exists() else {'schema':1,'stages':{}}
-        self.dataset=self.work/'relative_eef';self.checkpoint=self.work/'checkpoint'
+        self.spec=action_spec(args.action_mode,args.erj_joints.split(',') if args.erj_joints else None)
+        if args.elbow_control=='on' and args.action_mode!='erj':
+            raise ValueError('elbow_control=on requires action_mode=erj and a separately trained ERJ checkpoint')
+        self.dataset=self.work/('relative_erj' if args.action_mode=='erj' else 'relative_eef');self.checkpoint=self.work/'checkpoint'
+        self.replay_dir=self.work/(f'replay_{args.elbow_control}' if args.action_mode=='erj' else 'replay')
         self.sub=ROOT/'cyclo_brain/policy/lerobot/lerobot'
         self.model_files={p.name:sha256(p) for p in sorted(Path(args.scene).parent.glob('*.xml'))}
         self.code={str(p.relative_to(ROOT)):sha256(p) for p in
@@ -46,6 +50,7 @@ class Pipeline:
         self.train_code={p:self.code[p] for p in train_paths}
         self.inference_code={p:h for p,h in self.code.items() if '/lerobot_engine/' in p}
         self.verify_code={**self.train_code,**self.inference_code}
+        self.verify_code['scripts/statefree/validate_erj.py']=self.code['scripts/statefree/validate_erj.py']
         self.replay_code={**self.verify_code,**{p:self.code[p] for p in
                           ('scripts/statefree/replay.py','scripts/statefree/interpolation.py')}}
         self.common={'lerobot':BASE_COMMIT,'model':self.model_files}
@@ -84,10 +89,14 @@ class Pipeline:
 
     def prepare(self):
         if self.dataset.exists():
-            self.dataset.rename(self.work/f'relative_eef.previous-{time.time_ns()}')
-        return convert(self.a.dataset_root,self.dataset,self.a.episodes,self.a.scene)['validation']
+            self.dataset.rename(self.work/f'{self.dataset.name}.previous-{time.time_ns()}')
+        return convert(self.a.dataset_root,self.dataset,self.a.episodes,self.a.scene,
+                       self.a.action_mode,self.spec['erj_joints'])['validation']
 
     def verify(self):
+        if self.a.action_mode=='erj':
+            from validate_erj import validate
+            validate(self.dataset,self.a.scene,self.work/'erj_validation.json')
         run([sys.executable,ROOT/'scripts/statefree/policy.py','verify','--dataset',self.dataset,'--output',self.work/'verification'],self.work/'verify.log')
         return read_json(self.work/'verification/policy_tests.json')
 
@@ -111,7 +120,26 @@ class Pipeline:
         remote_run=remote+'/runs/'+train_key
         self.ssh('mkdir -p '+shlex.quote(remote_run))
         remote_dataset=remote_run+'/relative_eef'
-        run(['rsync','-azL',str(self.dataset)+'/',f'{self.a.ssh_host}:{remote_dataset}/'])
+        if self.a.remote_video_root:
+            # Reuse already transferred, byte-verified videos without uploading
+            # the same large source chunks for each action representation.
+            run(['rsync','-az','--exclude=videos',str(self.dataset)+'/',f'{self.a.ssh_host}:{remote_dataset}/'])
+            hashes={str(p.relative_to(self.dataset)):sha256(p) for p in (self.dataset/'videos').rglob('*.mp4')}
+            script=('import pathlib,hashlib,json\n'
+                    'root=pathlib.Path('+repr(self.a.remote_video_root)+')\n'
+                    'destination=pathlib.Path('+repr(remote_dataset)+')\n'
+                    'hashes='+repr(hashes)+'\n'
+                    'for name,digest in hashes.items():\n'
+                    ' source=root/name\n'
+                    ' assert source.is_file() and hashlib.file_digest(source.open("rb"),"sha256").hexdigest()==digest, f"Video cache mismatch: {source}"\n'
+                    ' target=destination/name; target.parent.mkdir(parents=True,exist_ok=True)\n'
+                    ' if target.is_symlink(): assert target.resolve()==source.resolve()\n'
+                    ' elif target.exists(): raise FileExistsError(target)\n'
+                    ' else: target.symlink_to(source.resolve())\n'
+                    'print(json.dumps({"reused_remote_videos":len(hashes)}))')
+            self.ssh(shlex.join([python,'-c',script]),self.work/'remote_video_reuse.log')
+        else:
+            run(['rsync','-azL',str(self.dataset)+'/',f'{self.a.ssh_host}:{remote_dataset}/'])
         env=f'cd {shlex.quote(code)} && PYTHONPATH=cyclo_brain/policy/lerobot/lerobot/src:scripts/statefree HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES={shlex.quote(self.a.gpu)} '
         progress_path=self.work/'remote_attempt.json'
         progress=read_json(progress_path) if progress_path.exists() else {}
@@ -160,15 +188,18 @@ class Pipeline:
         write_json(self.work/'checkpoint_sha256.json',json.loads(data))
         expected=sha256(self.sub/'src/lerobot/policies/diffusion/modeling_diffusion.py')
         assert result['diffusion_code_sha256']==expected
+        assert result['training_code_sha256']=={name:sha256(ROOT/'scripts/statefree'/name) for name in ('core.py','policy.py')}
         return result
 
     def replay(self):
         run([sys.executable,ROOT/'scripts/statefree/policy.py','reload','--dataset',self.dataset,'--output',self.checkpoint],self.work/'checkpoint_reload.log')
         command=[sys.executable,ROOT/'scripts/statefree/replay.py','--dataset',self.dataset,'--checkpoint',self.checkpoint,
-                 '--scene',self.a.scene,'--output',self.work/'replay','--frames',self.a.frames,'--episode',self.a.episode,
-                 '--interpolation',self.a.interpolation,'--control-fps',self.a.control_fps,'--video-fps',self.a.video_fps]
+                 '--scene',self.a.scene,'--output',self.replay_dir,'--frames',self.a.frames,'--episode',self.a.episode,
+                 '--interpolation',self.a.interpolation,'--control-fps',self.a.control_fps,'--video-fps',self.a.video_fps,
+                 '--action-mode',self.a.action_mode,'--elbow-control',self.a.elbow_control]
+        if self.a.actions_from:command+=['--actions-from',self.a.actions_from]
         if self.a.gui:command.append('--gui')
-        run(command,self.work/'replay.log');return read_json(self.work/'replay/replay_report.json')
+        run(command,self.work/(self.replay_dir.name+'.log'));return read_json(self.replay_dir/'replay_report.json')
 
     def preflight(self):
         import torch
@@ -191,16 +222,20 @@ class Pipeline:
     def execute(self):
         self.preflight()
         source=self.source_inputs()
-        self.stage('convert',{'source':source,'episodes':self.a.episodes,'core':self.code['scripts/statefree/core.py'],'model':self.model_files,'urdf':sha256(URDF)},self.prepare,[self.dataset])
+        self.stage('convert',{'source':source,'episodes':self.a.episodes,'action_spec':self.spec,'core':self.code['scripts/statefree/core.py'],'model':self.model_files,'urdf':sha256(URDF)},self.prepare,[self.dataset])
         data=files_digest(self.dataset)
-        self.stage('verify',{'data':data,'code':self.verify_code},self.verify,[self.work/'verification/policy_tests.json'])
+        verification_outputs=[self.work/'verification/policy_tests.json']
+        if self.a.action_mode=='erj':verification_outputs.append(self.work/'erj_validation.json')
+        self.stage('verify',{'data':data,'code':self.verify_code},self.verify,verification_outputs)
         if not self.a.replay_only:
             self.stage('train',{'data':data,'code':self.train_code,'seconds':self.a.train_seconds,'host':self.a.ssh_host,'python':self.a.remote_python,'gpu':self.a.gpu},self.train,[self.checkpoint,self.work/'training.json',self.work/'checkpoint_sha256.json'])
         elif not (self.checkpoint/'model.safetensors').exists():raise FileNotFoundError('No retrieved checkpoint; run the complete pipeline first')
         inputs={'checkpoint':files_digest(self.checkpoint),'data':data,'code':self.replay_code,'model':self.common,'frames':self.a.frames,
-                'episode':self.a.episode,'interpolation':self.a.interpolation,'control_fps':self.a.control_fps,'video_fps':self.a.video_fps}
-        if self.a.gui:self.manifest['stages'].pop('replay',None)
-        self.stage('replay',inputs,self.replay,[self.work/'replay'])
+                'episode':self.a.episode,'action_mode':self.a.action_mode,'elbow_control':self.a.elbow_control,
+                'actions_from':sha256(self.a.actions_from) if self.a.actions_from else None,
+                'interpolation':self.a.interpolation,'control_fps':self.a.control_fps,'video_fps':self.a.video_fps}
+        if self.a.gui:self.manifest['stages'].pop(self.replay_dir.name,None)
+        self.stage(self.replay_dir.name,inputs,self.replay,[self.replay_dir])
         summary={k:{'status':v['status'],'result':v.get('result')} for k,v in self.manifest['stages'].items()}
         write_json(self.work/'summary.json',summary);print('Results: '+str(self.work/'summary.json'),flush=True)
 
@@ -210,6 +245,11 @@ def parser():
     p.add_argument('--train-seconds',type=float,default=300.0);p.add_argument('--sim',choices=['mujoco'],default='mujoco')
     p.add_argument('--episodes',default='0,1');p.add_argument('--frames',type=int,default=300)
     p.add_argument('--episode',type=int,default=0,help='Converted dataset episode index for replay')
+    p.add_argument('--action-mode',choices=['eef','erj'],default='eef')
+    p.add_argument('--elbow-control',choices=['on','off'],default='off')
+    p.add_argument('--erj-joints',help='One left and one right arm joint, comma-separated; defaults to arm_l_joint1,arm_r_joint1 for ERJ')
+    p.add_argument('--actions-from',help='Verified replay.npz containing frozen predictions for ON/OFF comparison')
+    p.add_argument('--remote-video-root',help='Existing remote dataset root whose videos will be hash-verified and linked')
     p.add_argument('--work-dir',default=str(ROOT.parent/'statefree_smoke'));p.add_argument('--scene',default='/home/son/Downloads/AI_Worker_Practice/third_party/robotis_mujoco_menagerie/robotis_ffw/scene_ffw_sg2.xml')
     p.add_argument('--remote-dir',default='/data/son_statefree_smoke');p.add_argument('--remote-python',default='/data/son_statefree_smoke/venv/bin/python')
     p.add_argument('--gpu',default='0');p.add_argument('--replay-only',action='store_true');p.add_argument('--gui',action='store_true')

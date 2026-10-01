@@ -20,6 +20,15 @@ class RecordedObservationMixin:
         metadata = json.loads((Path(model_path) / "action_representation.json").read_text())
         if metadata["representation"] != "per_step_body_se3_rotvec":
             raise ValueError("Unsupported recorded EEF action representation")
+        mode = metadata.get('action_mode', 'eef')
+        joints = metadata.get('erj_joints', [])
+        if mode not in ('eef', 'erj') or len(metadata['action_layout']) != (19 if mode == 'erj' else 17):
+            raise ValueError('Invalid recorded EEF/ERJ action mode or dimension')
+        if (mode == 'eef' and joints) or (mode == 'erj' and (len(joints) != 2 or
+                any(name not in [f'arm_{side}_joint{i}' for i in range(1, 8)]
+                    for side, name in zip(('l', 'r'), joints)) or
+                metadata['action_layout'][17:] != [f'{name}_absolute_rad' for name in joints])):
+            raise ValueError('Invalid ERJ named joint action specification')
         self._device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._policy, self._preprocessor, self._postprocessor = self._load_policy_assets(model_path, self._device)
         cfg = self._policy.config
