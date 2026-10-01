@@ -50,3 +50,42 @@ def test_failed_stage_is_retried(tmp_path):
     assert p.manifest['stages']['test']['status']=='FAIL'
     p.stage('test',{},lambda: output.write_text('recovered'),[output])
     assert p.manifest['stages']['test']['status']=='PASS'
+
+
+def episode_fixture():
+    import pyarrow as pa
+    from core import CAMERAS
+    table = pa.table({'episode_index':[7]*3, 'frame_index':[0,1,2],
+                      'index':[10,11,12], 'timestamp':[0.,1/30,2/30]})
+    ep = {'episode_index':7,'length':4,'dataset_from_index':10,'dataset_to_index':13}
+    for cam in CAMERAS:
+        ep[f'videos/{cam}/from_timestamp'] = 2.
+        ep[f'videos/{cam}/to_timestamp'] = 2.1
+    return table, ep
+
+
+def test_stale_episode_length_requires_independent_alignment_evidence():
+    from core import validate_episode_alignment
+    table, ep = episode_fixture()
+    corrections = validate_episode_alignment(table, ep, 30)
+    assert corrections[0]['source'] == 4 and corrections[0]['converted'] == 3
+    assert ep['length'] == 4  # Source metadata is preserved.
+
+
+def test_short_video_cannot_silently_train_on_another_episode():
+    import pytest
+    from core import CAMERAS, validate_episode_alignment
+    table, ep = episode_fixture()
+    ep[f'videos/{CAMERAS[1]}/to_timestamp'] = 2 + 1/30
+    with pytest.raises(ValueError, match='video span'):
+        validate_episode_alignment(table, ep, 30)
+
+
+def test_episode_with_missing_frame_is_rejected():
+    import pytest
+    import pyarrow as pa
+    from core import validate_episode_alignment
+    table, ep = episode_fixture()
+    table = table.set_column(1, 'frame_index', pa.array([0,2,3]))
+    with pytest.raises(ValueError, match='frame indices'):
+        validate_episode_alignment(table, ep, 30)

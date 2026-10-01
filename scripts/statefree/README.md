@@ -30,6 +30,20 @@ Use a new `--work-dir` for an entirely fresh run. `--episodes all` converts the
 full dataset, episode by episode; `--episodes 0,1` is the default small subset.
 The wrapper never commits or pushes automatically.
 
+Conversion checks episode frame indices, timestamps, dataset spans and both
+camera intervals before processing a row. A stale episode `length` is corrected
+only in the output metadata when those independent counts agree; the correction
+is recorded in `meta/action_representation.json`. Output global indices are
+regenerated, with inconsistent source indices recorded. A mismatched video span
+is rejected rather than reading images from a following episode.
+
+The full `merge_0616_to_0819_v3` audit found stale lengths in source episodes
+160–168 and inconsistent global indices in 125 and 170. Source episode 169 has
+1,663 data rows but a 50-frame camera interval, so it must be repaired from the
+original recordings or explicitly excluded. The extended 200,000-step run uses
+the other 368 episodes (224,956 frames), retaining the original files. Therefore
+`--episodes all` correctly rejects episode 169 in this source dataset.
+
 ## Environment and managed patch
 
 The parent repository pins LeRobot to

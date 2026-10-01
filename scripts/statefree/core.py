@@ -180,6 +180,34 @@ def scalar_stats(x):
         'count': [len(x)]}
 
 
+def validate_episode_alignment(table, episode, fps):
+    """Accept a stale length only when rows, timestamps and both video spans agree."""
+    n = len(table)
+    episode_id = int(episode['episode_index'])
+    if n <= 0 or n != episode['dataset_to_index'] - episode['dataset_from_index']:
+        raise ValueError(f'Episode {episode_id}: row count disagrees with dataset span')
+    if table['episode_index'].to_pylist() != [episode_id] * n:
+        raise ValueError(f'Episode {episode_id}: mixed episode rows')
+    if table['frame_index'].to_pylist() != list(range(n)):
+        raise ValueError(f'Episode {episode_id}: missing or unordered frame indices')
+    if not np.allclose(table['timestamp'].to_numpy(), np.arange(n) / fps, rtol=0, atol=1e-4):
+        raise ValueError(f'Episode {episode_id}: timestamps do not match frame indices')
+    for camera in CAMERAS:
+        prefix = f'videos/{camera}/'
+        video_frames = (episode[prefix+'to_timestamp'] - episode[prefix+'from_timestamp']) * fps
+        if not np.isclose(video_frames, n, rtol=0, atol=1e-4):
+            raise ValueError(f'Episode {episode_id}: {camera} video span has {video_frames:g} frames, rows have {n}')
+    corrections = []
+    if episode['length'] != n:
+        corrections.append({'source_episode':episode_id, 'field':'length', 'source':episode['length'],
+                            'converted':n, 'evidence':'rows, frame timestamps, dataset span and both video intervals agree'})
+    expected_index = list(range(episode['dataset_from_index'], episode['dataset_to_index']))
+    if table['index'].to_pylist() != expected_index:
+        corrections.append({'source_episode':episode_id, 'field':'index',
+                            'evidence':'episode and frame indices checked; output global index regenerated'})
+    return corrections
+
+
 def convert(source, destination, episodes, scene):
     """Write real LeRobot v3 metadata/parquet; link unchanged source videos."""
     import copy
@@ -211,16 +239,17 @@ def convert(source, destination, episodes, scene):
     new_rows, all_stats, source_files = [], [], {source/'meta/info.json', source/'meta/tasks.parquet'}
     source_files.update((source/'meta/episodes').rglob('*.parquet'))
     offset, worst_reconstruction, worst_fk = 0, 0., 0.
-    checks = []
+    checks, metadata_corrections = [], []
     for new_index, ep_index in enumerate(selected):
         ep = episode_rows[ep_index]
         data_path = source / info['data_path'].format(chunk_index=ep['data/chunk_index'], file_index=ep['data/file_index'])
         source_files.add(data_path)
         table = pq.read_table(data_path, filters=[('episode_index', '=', ep_index)])
+        metadata_corrections.extend(validate_episode_alignment(table, ep, info['fps']))
         state = np.asarray(table['observation.state'].to_pylist(), dtype=np.float64)
         joint_action = np.asarray(table['action'].to_pylist(), dtype=np.float64)
         n = len(state)
-        assert state.shape == joint_action.shape == (ep['length'], len(names))
+        assert state.shape == joint_action.shape == (len(table), len(names))
         assert np.isfinite(state).all() and np.isfinite(joint_action).all()
         assert table['frame_index'].to_pylist() == list(range(n))
         reference = np.stack([fk.eef(q, names) for q in state])
@@ -250,7 +279,7 @@ def convert(source, destination, episodes, scene):
                             state=state, joint_action=joint_action, reference_eef=reference, target_eef=target,
                             source_episode=ep_index, names=np.array(names))
         row = {k: v for k, v in ep.items() if not k.startswith('stats/') and not k.startswith('videos/')}
-        row.update(episode_index=new_index, **{'data/chunk_index':new_index//1000, 'data/file_index':new_index%1000,
+        row.update(episode_index=new_index, length=n, **{'data/chunk_index':new_index//1000, 'data/file_index':new_index%1000,
                                              'dataset_from_index':offset, 'dataset_to_index':offset+n,
                                              'meta/episodes/chunk_index':0, 'meta/episodes/file_index':0})
         stats = {k: scalar_stats(out[k].to_pylist()) for k in out.column_names}
@@ -301,6 +330,7 @@ def convert(source, destination, episodes, scene):
         'policy_input_keys':CAMERAS, 'reference_storage':'reference/*.npz; never loaded by training dataset',
         'source_root':str(source), 'source_episodes':selected, 'source_total_episodes':info['total_episodes'],
         'source_total_frames':info['total_frames'], 'converted_frames':offset,
+        'source_metadata_corrections':metadata_corrections,
         'source_sha256':{str(p.relative_to(source)):sha256(p) for p in sorted(source_files)},
         'urdf_sha256':sha256(URDF), 'model_scene':str(Path(scene).resolve()),
         'model_base_revision':'d8344c0dbe7a00208d0301111523dde65efc174a (local practice copy; hashes authoritative)',
