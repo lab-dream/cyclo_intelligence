@@ -16,7 +16,7 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from core import CAMERAS, Robot, compose, read_json, sha256, transform, write_json
-from interpolation import METHODS, blend, sample_joints, rates, motion_metrics
+from interpolation import METHODS, blend, sample_joints, rates, control_bounds, motion_metrics
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_engine import LeRobotEngine
 
@@ -76,7 +76,7 @@ def render_frame(renderer, robot, camera, target, achieved, reference, trails, s
 
 
 def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
-           interpolation='quintic',control_fps=240,video_fps=120,actions_from=None):
+           interpolation='quintic',control_fps=100,video_fps=100,actions_from=None):
     torch.set_num_threads(4);torch.manual_seed(42)
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     if interpolation not in METHODS:raise ValueError(f'Unknown interpolation: {interpolation}')
@@ -111,9 +111,11 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
     frames=min(frames,len(ref['state']))
     if cached is not None and len(cached['raw_action']) < frames:raise ValueError('Not enough cached actions')
     fps=metadata['fps']; camera=mujoco.MjvCamera()
-    substeps,render_stride=rates(fps,control_fps,video_fps)
-    if interpolation!='none' and substeps < 2:raise ValueError('Spline interpolation requires a control rate above the policy rate')
-    if frames*substeps % render_stride:raise ValueError('Video must contain a whole number of frames')
+    ratio,render_stride=rates(fps,control_fps,video_fps)
+    if interpolation!='none' and ratio < 2:raise ValueError('Spline interpolation requires at least two control ticks per policy frame')
+    bounds=np.array([control_bounds(frame,fps,control_fps) for frame in range(frames)],dtype=np.int64)
+    total_ticks=int(bounds[-1,1])
+    if total_ticks % render_stride:raise ValueError('Video must contain a whole number of frames; use --video-fps equal to control rate')
     joint_names=names[:19]
     joint_ids=np.array([robot.model.joint(name).qposadr[0] for name in joint_names])
     camera.lookat[:]=[.02,0,.92];camera.distance=2.65;camera.azimuth=215;camera.elevation=-16
@@ -131,14 +133,16 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
         viewer_threads=[thread for thread in threading.enumerate() if thread not in preceding_threads]
         viewer.cam.lookat[:]=camera.lookat;viewer.cam.distance=camera.distance;viewer.cam.azimuth=camera.azimuth;viewer.cam.elevation=camera.elevation
     logs={k:[] for k in ('raw_action','normalized_action','applied_action','raw_target','target','achieved','reference','qpos','joint_result',
-                             'limited','ik_ok','ik_position_residual','ik_rotation_residual','achieved_position_error','inference_seconds','chunk_index')}
+                             'limited','ik_ok','ik_position_residual','ik_rotation_residual','achieved_position_error','inference_seconds','chunk_index',
+                             'source_time','segment_start_time','segment_end_time')}
     chunk=None;chunk_position=0;chunk_index=-1;latency=0.;inference_total=0.;ik_total=0.
     trajectory={'time':[0.], 'joint_result':[initial[joint_ids].copy()], 'eef':[robot.eef()],
-                'cartesian_chord_error_m':[np.zeros(2)]}
+                'cartesian_chord_error_m':[np.zeros(2)],'control_tick':[0],'policy_frame':[-1],'phase':[0.]}
     rendered_frames=0
     trails=[[],[],[]];wall_start=time.perf_counter()
     try:
         for frame in range(frames):
+            start_tick,end_tick=map(int,bounds[frame]);substeps=end_tick-start_tick
             sample=ds[start+frame]
             if cached is None:
                 engine.observe_recorded(sample)
@@ -176,7 +180,8 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
             limited=np.abs(applied-raw)>1e-10
             joint_result=np.array([robot.data.qpos[robot.model.joint(name).qposadr[0]] for name in names[:19]])
             values=(raw,normalized,applied,raw_target,target,achieved,reference,robot.data.qpos.copy(),joint_result,
-                    limited,ok,poserr,roterr,np.linalg.norm(target[:,:3,3]-achieved[:,:3,3],axis=1),current_latency,chunk_index)
+                    limited,ok,poserr,roterr,np.linalg.norm(target[:,:3,3]-achieved[:,:3,3],axis=1),current_latency,chunk_index,
+                    frame/fps,start_tick/control_fps,end_tick/control_fps)
             for key,value in zip(logs,values,strict=True):logs[key].append(value)
             # The IK endpoint is solved once. Only its accepted joint motion is
             # time-parameterized, so all modes retain identical next-frame origins.
@@ -187,14 +192,17 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                 robot.mimic()
                 if substep==substeps:robot.data.qpos[:]=goal
                 mujoco.mj_forward(robot.model,robot.data)
-                pose=robot.eef();control_time=(frame+u)/fps
+                pose=robot.eef();tick=start_tick+substep;control_time=tick/control_fps
                 alpha=float(blend(u,interpolation))
                 chord=current[:,:3,3]+alpha*(achieved[:,:3,3]-current[:,:3,3])
                 trajectory['time'].append(control_time)
                 trajectory['joint_result'].append(robot.data.qpos[joint_ids].copy())
                 trajectory['eef'].append(pose)
                 trajectory['cartesian_chord_error_m'].append(np.linalg.norm(pose[:,:3,3]-chord,axis=1))
-                if ((frame*substeps+substep) % render_stride)==0:
+                trajectory['control_tick'].append(tick)
+                trajectory['policy_frame'].append(frame)
+                trajectory['phase'].append(u)
+                if tick % render_stride==0:
                     for trail,poses in zip(trails,(target,pose,reference)):trail.append(poses.copy())
                     rgb=render_frame(renderer,robot,camera,target,pose,reference,trails,sample,frame,fps,ok,int(limited.sum()),latency,
                                      interpolation,control_time,control_fps)
@@ -222,16 +230,32 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
     arrays={k:np.asarray(v) for k,v in logs.items()};np.savez_compressed(output/'replay.npz',**arrays,initial_qpos=initial,joint_names=names[:19])
     path={k:np.asarray(v) for k,v in trajectory.items()}
     np.savez_compressed(output/'trajectory.npz',**path,joint_names=joint_names)
-    assert np.array_equal(path['joint_result'][substeps::substeps],arrays['joint_result'])
+    np.savetxt(output/'commands.csv',np.column_stack((path['time'][1:],path['control_tick'][1:],
+               path['policy_frame'][1:],path['joint_result'][1:])),delimiter=',',
+               header=','.join(['time_s','control_tick','policy_frame']+joint_names),comments='',
+               fmt=['%.9f','%d','%d']+['%.12f']*len(joint_names))
+    assert np.array_equal(path['joint_result'][bounds[:,1]],arrays['joint_result'])
+    assert np.array_equal(path['control_tick'],np.arange(total_ticks+1))
     motion=float(np.max(np.abs(arrays['qpos']-initial)))
     arm_ids=[robot.model.joint(f'arm_{s}_joint{i}').qposadr[0] for s in ('l','r') for i in range(1,8)]
     arm_motion=float(np.max(np.abs(arrays['qpos'][:,arm_ids]-initial[arm_ids])))
-    assert arm_motion>1e-5, 'Markers and auxiliary joints alone do not verify arm motion'
-    assert motion>1e-5 and chunk_index>=2,'Robot must actually move over multiple policy chunks'
-    report={'status':'PASS','mode':'recorded-observation replay; MuJoCo kinematic qpos update; no closed-loop/task evaluation',
-        'episode':episode,'source_episode':int(ref['source_episode']),'frames':frames,'fps':fps,'simulation_seconds':frames/fps,
+    failures=[]
+    if arm_motion<=1e-5:failures.append('No verified arm motion; marker or auxiliary motion alone is insufficient')
+    if motion<=1e-5 or chunk_index<2:failures.append('Robot must actually move over multiple policy chunks')
+    report={'status':'FAIL' if failures else 'PASS','validation_failures':failures,
+        'mode':'recorded-observation replay; MuJoCo kinematic qpos update; no closed-loop/task evaluation',
+        'episode':episode,'source_episode':int(ref['source_episode']),'frames':frames,'fps':fps,
+        'simulation_seconds':total_ticks/control_fps,'source_seconds':frames/fps,
         'interpolation':interpolation,'interpolation_space':'IK joint waypoints; cubic C1 / quintic C2, zero boundary velocity; quintic also zero boundary acceleration',
         'control_fps':control_fps,'control_samples':len(path['time']),'video_fps':video_fps,'video_frames':rendered_frames,
+        'timing':{'schedule':'ceil source frame boundaries to uniform control ticks; no early observations or hidden endpoint jumps',
+                  'control_interval_s':1/control_fps,'commands':total_ticks,'initial_state_samples':1,
+                  'segment_tick_counts':{str(n):int(np.sum(np.diff(bounds,axis=1).ravel()==n)) for n in np.unique(np.diff(bounds,axis=1))},
+                  'max_source_release_delay_s':float(np.max(arrays['segment_start_time']-arrays['source_time'])),
+                  'max_control_period_error_s':float(np.max(np.abs(np.diff(path['time'])-1/control_fps))),
+                  'last_source_boundary_delay_s':total_ticks/control_fps-frames/fps,
+                  'execution':'offline time-indexed command stream; no hardware publisher or real-time deadline guarantee'},
+        'base_velocity_nonzero_frames':int(np.any(np.abs(ref['joint_action'][:frames,19:])>1e-8,axis=1).sum()),
         'action_source':'live Cyclo inference' if cached is None else 'frozen actions from '+str(Path(actions_from).resolve()),
         'checkpoint_model_sha256':checkpoint_hash,'action_metadata_sha256':action_metadata_hash,
         'motion_metrics':motion_metrics(path['joint_result'],joint_names,1/control_fps),
@@ -248,6 +272,7 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                   'gripper_step_rad':.05,'head_step_rad':.03,'lift_step_m':.008},
         'failure_behavior':'hold all preceding qpos; never replace with recorded joints'}
     write_json(output/'replay_report.json',report);print(report,flush=True)
+    if failures:raise RuntimeError('; '.join(failures))
     return report
 
 
@@ -256,7 +281,7 @@ if __name__=='__main__':
     p.add_argument('--scene',required=True);p.add_argument('--output',required=True);p.add_argument('--frames',type=int,default=300)
     p.add_argument('--episode',type=int,default=0);p.add_argument('--gui',action='store_true')
     p.add_argument('--interpolation',choices=METHODS,default='quintic')
-    p.add_argument('--control-fps',type=int,default=240);p.add_argument('--video-fps',type=int,default=120)
+    p.add_argument('--control-fps',type=int,default=100);p.add_argument('--video-fps',type=int,default=100)
     p.add_argument('--actions-from',help='Replay frozen predictions from a verified replay.npz for a fair comparison')
     a=p.parse_args()
     replay(a.dataset,a.checkpoint,a.scene,a.output,a.frames,a.episode,a.gui,

@@ -165,7 +165,7 @@ class Pipeline:
     def replay(self):
         run([sys.executable,ROOT/'scripts/statefree/policy.py','reload','--dataset',self.dataset,'--output',self.checkpoint],self.work/'checkpoint_reload.log')
         command=[sys.executable,ROOT/'scripts/statefree/replay.py','--dataset',self.dataset,'--checkpoint',self.checkpoint,
-                 '--scene',self.a.scene,'--output',self.work/'replay','--frames',self.a.frames,
+                 '--scene',self.a.scene,'--output',self.work/'replay','--frames',self.a.frames,'--episode',self.a.episode,
                  '--interpolation',self.a.interpolation,'--control-fps',self.a.control_fps,'--video-fps',self.a.video_fps]
         if self.a.gui:command.append('--gui')
         run(command,self.work/'replay.log');return read_json(self.work/'replay/replay_report.json')
@@ -198,7 +198,7 @@ class Pipeline:
             self.stage('train',{'data':data,'code':self.train_code,'seconds':self.a.train_seconds,'host':self.a.ssh_host,'python':self.a.remote_python,'gpu':self.a.gpu},self.train,[self.checkpoint,self.work/'training.json',self.work/'checkpoint_sha256.json'])
         elif not (self.checkpoint/'model.safetensors').exists():raise FileNotFoundError('No retrieved checkpoint; run the complete pipeline first')
         inputs={'checkpoint':files_digest(self.checkpoint),'data':data,'code':self.replay_code,'model':self.common,'frames':self.a.frames,
-                'interpolation':self.a.interpolation,'control_fps':self.a.control_fps,'video_fps':self.a.video_fps}
+                'episode':self.a.episode,'interpolation':self.a.interpolation,'control_fps':self.a.control_fps,'video_fps':self.a.video_fps}
         if self.a.gui:self.manifest['stages'].pop('replay',None)
         self.stage('replay',inputs,self.replay,[self.work/'replay'])
         summary={k:{'status':v['status'],'result':v.get('result')} for k,v in self.manifest['stages'].items()}
@@ -209,11 +209,12 @@ def parser():
     p=argparse.ArgumentParser();p.add_argument('--dataset-root',required=True);p.add_argument('--ssh-host',default='gpuserver')
     p.add_argument('--train-seconds',type=float,default=300.0);p.add_argument('--sim',choices=['mujoco'],default='mujoco')
     p.add_argument('--episodes',default='0,1');p.add_argument('--frames',type=int,default=300)
+    p.add_argument('--episode',type=int,default=0,help='Converted dataset episode index for replay')
     p.add_argument('--work-dir',default=str(ROOT.parent/'statefree_smoke'));p.add_argument('--scene',default='/home/son/Downloads/AI_Worker_Practice/third_party/robotis_mujoco_menagerie/robotis_ffw/scene_ffw_sg2.xml')
     p.add_argument('--remote-dir',default='/data/son_statefree_smoke');p.add_argument('--remote-python',default='/data/son_statefree_smoke/venv/bin/python')
     p.add_argument('--gpu',default='0');p.add_argument('--replay-only',action='store_true');p.add_argument('--gui',action='store_true')
     p.add_argument('--interpolation',choices=['none','cubic','quintic'],default='quintic')
-    p.add_argument('--control-fps',type=int,default=240);p.add_argument('--video-fps',type=int,default=120)
+    p.add_argument('--control-fps',type=int,default=100);p.add_argument('--video-fps',type=int,default=100)
     return p
 
 

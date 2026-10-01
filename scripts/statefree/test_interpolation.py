@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from interpolation import blend, sample_joints, rates, motion_metrics
+from interpolation import blend, sample_joints, rates, control_bounds, motion_metrics
 
 
 @pytest.mark.parametrize('method', ['cubic', 'quintic'])
@@ -44,7 +44,38 @@ def test_both_splines_reduce_sampled_jerk_relative_to_steps():
 
 def test_invalid_rates_and_phases_rejected():
     assert rates(30, 240, 120) == (8, 2)
+    assert rates(30, 100, 100) == (100/30, 1)
     with pytest.raises(ValueError): rates(30, 200, 120)
+    with pytest.raises(ValueError): rates(30, 20, 20)
     with pytest.raises(ValueError): blend(-.1, 'cubic')
     with pytest.raises(ValueError): blend(np.nan, 'quintic')
     with pytest.raises(ValueError): blend(.5, 'none', 1)
+
+
+def test_100hz_clock_has_no_cumulative_drift_or_early_observations():
+    bounds=np.array([control_bounds(i,30,100) for i in range(300)])
+    np.testing.assert_array_equal(bounds[:3],[[0,4],[4,7],[7,10]])
+    np.testing.assert_array_equal(bounds[:-1,1],bounds[1:,0])
+    assert bounds[-1,1] == 1000
+    assert control_bounds(17999,30,100)[1] == 60000
+    delay=bounds[:,0]/100-np.arange(300)/30
+    assert delay.min() >= -1e-14 and delay.max() < .01
+    ticks=np.concatenate([np.arange(start+1,end+1) for start,end in bounds])
+    np.testing.assert_array_equal(ticks,np.arange(1,1001))
+    np.testing.assert_allclose(np.diff(ticks/100),.01,rtol=0,atol=2e-15)
+
+
+@pytest.mark.parametrize('method',['none','cubic','quintic'])
+def test_100hz_noninteger_segments_reach_each_waypoint_on_a_sent_tick(method):
+    goals=np.array([[.1,-.05],[.12,-.07],[.12,-.07],[0.,0.]])
+    previous=np.zeros(2);path=[previous]
+    for frame,goal in enumerate(goals):
+        start,end=control_bounds(frame,30,100)
+        for tick in range(start+1,end+1):
+            q=sample_joints(previous,goal,(tick-start)/(end-start),method)
+            assert np.all(q>=np.minimum(previous,goal)-1e-14)
+            assert np.all(q<=np.maximum(previous,goal)+1e-14)
+            path.append(q)
+        assert np.array_equal(path[end],goal)
+        previous=path[end]
+    np.testing.assert_array_equal(np.asarray(path)[7:11],np.repeat(goals[1][None],4,axis=0))

@@ -32,14 +32,19 @@ The wrapper never commits or pushes automatically.
 
 ## Cubic and quintic joint interpolation
 
-Replay now defaults to `--interpolation quintic --control-fps 240 --video-fps 120`.
+Replay now defaults to `--interpolation quintic --control-fps 100 --video-fps 100`.
 Use `--interpolation cubic` for cubic Hermite segments, or `--interpolation none`
 for the step baseline. The wrapper passes these options through and includes
 them, together with the interpolation source hash, in replay cache validation.
 
-Each relative EEF action is composed once at the 30 Hz policy boundary. IK is
+Each relative EEF action is composed once at its tick-aligned policy boundary. IK is
 solved once for that target with the existing limits and failure handling.
-The accepted joint waypoint is reached over the next 1/30 second using
+Source action boundaries are rounded **up** to the next 10 ms control tick.
+At 30 Hz input and 100 Hz output, segments use 4, 3, 3 ticks (40, 30, 30 ms),
+repeating every 0.1 second. Exactly 1,000 commands are emitted for 300 source
+actions over 10 seconds. No future observation is consumed; release delay is
+0, 6.667, or 3.333 ms. There are no unsent waypoint updates between ticks.
+The accepted waypoint is reached at its segment end using
 `q(u) = q_start + s(u) * (q_goal - q_start)`, with `u` in `[0, 1]`:
 
 - Cubic: `s(u) = 3u^2 - 2u^3`, zero endpoint velocity, piecewise C1.
@@ -55,20 +60,37 @@ interval. Monotone blend weights cannot overshoot valid endpoint joint ranges.
 The original measured initialization can already be outside the model limits;
 its documented correction is preserved rather than silently replacing it.
 
-`trajectory.npz` contains the initial state and every 240 Hz sample, separate
+`commands.csv` exports every 100 Hz command (time, tick, source policy frame,
+and 19 named controlled joint positions). `trajectory.npz` contains the initial state and every 100 Hz sample, separate
 from the 30 Hz policy/IK endpoint log in `replay.npz`. The report includes
 finite-difference velocity, acceleration and jerk at that common sample rate,
 and EEF deviation from the chord between achieved endpoints. These are
 kinematic metrics, not a dynamics, collision, or hardware control validation.
 C2 continuity alone does not guarantee a smaller sampled jerk than cubic.
 Motion pauses at each waypoint; no lookahead spline or time-optimal retiming
-is implied. Encoded 120 FPS videos preserve intermediate samples; slow playback
+is implied. Encoded 100 FPS videos preserve intermediate samples; slow playback
 makes cubic/quintic differences visible on a 60 Hz display.
 
 For a controlled comparison, run `replay.py --interpolation none` once, then
 pass `--actions-from /path/to/none/replay.npz` to cubic and quintic runs. The
 checkpoint hash, dataset action-metadata hash and episode are checked before
 reusing frozen predictions. This avoids stochastic inference differences.
+
+For multi-episode evidence, use `scripts/statefree/evaluate_replay.py` with the
+same Python/import environment as replay, plus `--dataset`, `--checkpoint`,
+`--scene`, and a fresh `--output` directory. `--source-episodes 0,1,56,170,368`
+selects original dataset IDs and resolves them through conversion metadata
+(source 170 maps to converted index 169 after excluding damaged source 169).
+It runs live Cyclo inference separately for each episode, freezes predictions
+for the cubic/quintic comparison, checks uniform ticks and exact endpoints,
+and saves 1×/0.25× comparison videos plus `suite.json`. These are training-data
+recorded-observation replays, not held-out task-success evaluations.
+
+The 100 Hz rate specifies the offline command timestamp grid, not a measured
+real-time hardware publishing deadline. No physical robot publisher is started.
+Inference still produces chunks on the original 30 Hz action time base; it is
+not called 100 times per second. The fixed-rate output must be kept separate
+from inference/rendering when integrating an actual controller.
 
 Conversion checks episode frame indices, timestamps, dataset spans and both
 camera intervals before processing a row. A stale episode `length` is corrected

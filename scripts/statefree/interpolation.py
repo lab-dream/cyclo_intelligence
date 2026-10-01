@@ -4,6 +4,7 @@ Policy targets remain at the dataset rate. Interpolation samples the already
 accepted joint segment; it neither re-applies a relative action nor runs IK
 against a succession of different intermediate targets.
 """
+from fractions import Fraction
 import numpy as np
 
 METHODS = ('none', 'cubic', 'quintic')
@@ -39,12 +40,28 @@ def sample_joints(start, goal, u, method):
 
 
 def rates(policy_fps, control_fps, video_fps):
-    if min(policy_fps, control_fps, video_fps) <= 0:
-        raise ValueError('All rates must be positive')
-    ratio = control_fps / policy_fps
-    if not np.isclose(ratio, round(ratio)) or control_fps % video_fps:
-        raise ValueError('Control rate must be divisible by policy and video rates')
-    return int(round(ratio)), int(control_fps // video_fps)
+    if not np.isfinite([policy_fps,control_fps,video_fps]).all() or min(policy_fps,control_fps,video_fps) <= 0:
+        raise ValueError('All rates must be finite and positive')
+    if control_fps < policy_fps or control_fps % video_fps:
+        raise ValueError('Control rate must cover policy rate and be divisible by video rate')
+    return control_fps / policy_fps, int(control_fps // video_fps)
+
+
+def control_bounds(frame, policy_fps, control_fps):
+    """Causal policy boundaries on an independent, uniform control clock.
+
+Ceiling to the next tick adds less than one tick of delay. For 30 -> 100 Hz,
+durations are 4, 3, 3 ticks, repeating without accumulated drift. Each actual
+sent endpoint becomes the next relative-action origin; no hidden state update
+is made at a 33.333 ms timestamp between real control commands.
+"""
+    if frame < 0 or int(frame) != frame or policy_fps <= 0 or control_fps < policy_fps:
+        raise ValueError('Invalid frame or control/policy rate')
+    ratio = Fraction(str(control_fps)) / Fraction(str(policy_fps))
+    def ceil_tick(index):
+        value = index * ratio
+        return (value.numerator + value.denominator - 1) // value.denominator
+    return ceil_tick(frame), ceil_tick(frame+1)
 
 
 def motion_metrics(joints, joint_names, dt):
