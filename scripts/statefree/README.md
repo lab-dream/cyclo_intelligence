@@ -30,6 +30,46 @@ Use a new `--work-dir` for an entirely fresh run. `--episodes all` converts the
 full dataset, episode by episode; `--episodes 0,1` is the default small subset.
 The wrapper never commits or pushes automatically.
 
+## Cubic and quintic joint interpolation
+
+Replay now defaults to `--interpolation quintic --control-fps 240 --video-fps 120`.
+Use `--interpolation cubic` for cubic Hermite segments, or `--interpolation none`
+for the step baseline. The wrapper passes these options through and includes
+them, together with the interpolation source hash, in replay cache validation.
+
+Each relative EEF action is composed once at the 30 Hz policy boundary. IK is
+solved once for that target with the existing limits and failure handling.
+The accepted joint waypoint is reached over the next 1/30 second using
+`q(u) = q_start + s(u) * (q_goal - q_start)`, with `u` in `[0, 1]`:
+
+- Cubic: `s(u) = 3u^2 - 2u^3`, zero endpoint velocity, piecewise C1.
+- Quintic: `s(u) = 10u^3 - 15u^4 + 6u^5`, zero endpoint velocity and acceleration,
+  piecewise C2.
+- None: hold the preceding waypoint until the end of the same interval.
+
+Interpolation is in **joint space after IK**, not a Cartesian straight-line
+constraint. Only the 19 named controlled joints are interpolated; fixed base
+and other configuration coordinates are retained, and gripper mimic joints
+are updated. A rejected IK waypoint remains a constant hold for the entire
+interval. Monotone blend weights cannot overshoot valid endpoint joint ranges.
+The original measured initialization can already be outside the model limits;
+its documented correction is preserved rather than silently replacing it.
+
+`trajectory.npz` contains the initial state and every 240 Hz sample, separate
+from the 30 Hz policy/IK endpoint log in `replay.npz`. The report includes
+finite-difference velocity, acceleration and jerk at that common sample rate,
+and EEF deviation from the chord between achieved endpoints. These are
+kinematic metrics, not a dynamics, collision, or hardware control validation.
+C2 continuity alone does not guarantee a smaller sampled jerk than cubic.
+Motion pauses at each waypoint; no lookahead spline or time-optimal retiming
+is implied. Encoded 120 FPS videos preserve intermediate samples; slow playback
+makes cubic/quintic differences visible on a 60 Hz display.
+
+For a controlled comparison, run `replay.py --interpolation none` once, then
+pass `--actions-from /path/to/none/replay.npz` to cubic and quintic runs. The
+checkpoint hash, dataset action-metadata hash and episode are checked before
+reusing frozen predictions. This avoids stochastic inference differences.
+
 Conversion checks episode frame indices, timestamps, dataset spans and both
 camera intervals before processing a row. A stale episode `length` is corrected
 only in the output metadata when those independent counts agree; the correction
