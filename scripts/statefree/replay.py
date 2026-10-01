@@ -5,6 +5,7 @@ import os
 os.environ.setdefault('MUJOCO_GL','egl')
 os.environ.setdefault('HF_HUB_OFFLINE','1')
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -122,10 +123,12 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
     video=output/'replay.mp4'
     encoder=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','rawvideo','-pix_fmt','rgb24',
         '-s','1280x720','-r',str(video_fps),'-i','-','-an','-c:v','libx264','-preset','fast','-crf','22','-pix_fmt','yuv420p',str(video)],stdin=subprocess.PIPE)
-    viewer=None
+    viewer=None;viewer_threads=[]
     if gui:
         from mujoco import viewer as viewer_module
+        preceding_threads=set(threading.enumerate())
         viewer=viewer_module.launch_passive(robot.model,robot.data)
+        viewer_threads=[thread for thread in threading.enumerate() if thread not in preceding_threads]
         viewer.cam.lookat[:]=camera.lookat;viewer.cam.distance=camera.distance;viewer.cam.azimuth=camera.azimuth;viewer.cam.elevation=camera.elevation
     logs={k:[] for k in ('raw_action','normalized_action','applied_action','raw_target','target','achieved','reference','qpos','joint_result',
                              'limited','ik_ok','ik_position_residual','ik_rotation_residual','achieved_position_error','inference_seconds','chunk_index')}
@@ -205,8 +208,16 @@ def replay(dataset,checkpoint,scene,output,frames=300,episode=0,gui=False,
                 if viewer:time.sleep(max(0,wall_start+control_time-time.perf_counter()))
             if frame%60==0:print(f'Replay frame {frame}/{frames}; chunks={chunk_index+1}; IK ok={sum(logs["ik_ok"])}',flush=True)
     finally:
-        encoder.stdin.close();encoder.wait();renderer.close()
-        if viewer:viewer.close()
+        encoder.stdin.close();encoder.wait()
+        if viewer:
+            # Handle.close() requests exit but does not join the daemon render
+            # thread. Let our viewer finish before freeing the other GL context
+            # or letting GLFW's process-exit cleanup run.
+            viewer.close()
+            for thread in viewer_threads:thread.join(timeout=5)
+            if any(thread.is_alive() for thread in viewer_threads):
+                raise RuntimeError('MuJoCo viewer did not finish closing')
+        renderer.close()
     assert encoder.returncode==0 and video.stat().st_size>10000
     arrays={k:np.asarray(v) for k,v in logs.items()};np.savez_compressed(output/'replay.npz',**arrays,initial_qpos=initial,joint_names=names[:19])
     path={k:np.asarray(v) for k,v in trajectory.items()}
